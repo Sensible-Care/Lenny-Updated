@@ -363,7 +363,7 @@ export default function App() {
     if (participant.response_id) setResponseId(participant.response_id);
   }
 
-  async function resolveRecordKey(raw) {
+  async function resolveRecordKey(raw, forceRescan = false) {
     const rkMatch    = raw.match(/recordKey=([^&\s]+)/);
     const tokenMatch = raw.match(/wf_token=([^&\s]+)/);
 
@@ -379,7 +379,7 @@ export default function App() {
 
     // recordKey= URL param or plain text key
     const key = rkMatch ? decodeURIComponent(rkMatch[1]) : raw.trim();
-    const res = await fetch(`${WORKER_URL}/snapforms-proxy/resolve-record-key?recordKey=${encodeURIComponent(key)}`);
+    const res = await fetch(`${WORKER_URL}/snapforms-proxy/resolve-record-key?recordKey=${encodeURIComponent(key)}${forceRescan ? "&force=1" : ""}`);
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       throw new Error(`Could not resolve record key (${res.status})${body ? ": " + body : ""}`);
@@ -498,19 +498,28 @@ Do not include any explanation, markdown, or code fences. JSON only.${allText ? 
     }
     const data   = await res.json();
     const text   = data.content?.[0]?.text || "";
-    const clean  = text.replace(/```json|```/g, "").trim();
-    const parsed = JSON.parse(clean);
-    if (!parsed.fields || !Array.isArray(parsed.fields)) throw new Error("Unexpected response from Claude");
+    // Robust JSON extraction — handles Gemini responses that wrap JSON in code fences
+    // or append explanation text after the object
+    function extractJSON(raw) {
+      const stripped = raw.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+      const start = stripped.indexOf("{");
+      const end   = stripped.lastIndexOf("}");
+      if (start !== -1 && end > start) return stripped.slice(start, end + 1);
+      return stripped;
+    }
+    const parsed = JSON.parse(extractJSON(text));
+    if (!parsed.fields || !Array.isArray(parsed.fields)) throw new Error("Unexpected response from AI");
     return { fields: parsed.fields, detectedPronouns: parsed.pronouns || null };
   }
 
-  async function handleProcess() {
+  async function handleProcess(forceRescan = false) {
     setError(""); setLoading(true);
     try {
       // If participant was selected from the sidebar, responseId is already known — skip the scan
-      let rid = responseId;
+      // unless forceRescan=true (user clicked "Wrong participant? Re-scan")
+      let rid = forceRescan ? null : responseId;
       if (!rid) {
-        const resolved = await resolveRecordKey(inputValue);
+        const resolved = await resolveRecordKey(inputValue, forceRescan);
         rid = resolved.responseId;
         if (resolved.participantName) setParticipantName(resolved.participantName);
         setResponseId(rid);
@@ -762,9 +771,16 @@ Do not include any explanation, markdown, or code fences. JSON only.${allText ? 
 
               {error && <div style={S.error}>{error}</div>}
               <button style={loading || !inputValue.trim() || (!notes.trim() && attachedFiles.length === 0) ? S.btnDisabled : S.btnPrimary}
-                onClick={handleProcess} disabled={loading || !inputValue.trim() || (!notes.trim() && attachedFiles.length === 0)}>
+                onClick={() => handleProcess(false)} disabled={loading || !inputValue.trim() || (!notes.trim() && attachedFiles.length === 0)}>
                 {loading ? "Processing…" : "Analyse & Map Fields →"}
               </button>
+              {inputValue.trim() && !loading && (
+                <button
+                  style={{ marginTop: 8, width: "100%", padding: "9px 0", background: "transparent", color: "#888", border: `1px solid ${BORDER}`, borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: FONT }}
+                  onClick={() => handleProcess(true)}>
+                  ↺ Wrong participant? Re-scan Snapforms (bypasses cache)
+                </button>
+              )}
             </div>
           </div>
         </div>

@@ -218,23 +218,60 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // ── Claude proxy ─────────────────────────────────────────────────────────
+    // ── Gemini proxy ─────────────────────────────────────────────────────────
+    // Receives Anthropic-format requests from App.jsx, translates to Gemini,
+    // calls Gemini API, then returns Anthropic-format response so App.jsx
+    // needs no changes.
     if (path === "/claude-proxy" && request.method === "POST") {
       try {
-        const body      = await request.json();
-        const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type":      "application/json",
-            "x-api-key":         env.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-          },
-          body: JSON.stringify(body),
-        });
-        const data = await claudeRes.json();
-        return jsonResponse(data, claudeRes.status);
+        const body = await request.json();
+
+        // Map Anthropic model names to Gemini equivalents
+        const modelMap = {
+          "claude-sonnet-4-6":         "gemini-2.5-flash",
+          "claude-haiku-4-5-20251001": "gemini-2.5-flash",
+        };
+        const geminiModel = modelMap[body.model] || "gemini-2.5-flash";
+
+        // Convert Anthropic content blocks to Gemini parts
+        function toGeminiParts(content) {
+          if (typeof content === "string") return [{ text: content }];
+          if (!Array.isArray(content)) return [{ text: String(content) }];
+          return content.map(block => {
+            if (block.type === "text")     return { text: block.text };
+            if (block.type === "image")    return { inlineData: { mimeType: block.source.media_type, data: block.source.data } };
+            if (block.type === "document") return { inlineData: { mimeType: block.source.media_type, data: block.source.data } };
+            return { text: "" };
+          });
+        }
+
+        const geminiBody = {
+          contents: (body.messages || []).map(msg => ({
+            role:  msg.role === "assistant" ? "model" : "user",
+            parts: toGeminiParts(msg.content),
+          })),
+          generationConfig: { maxOutputTokens: body.max_tokens || 8192 },
+          // Disable safety blocks that could interfere with aged-care clinical content
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT",        threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH",       threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+          ],
+        };
+
+        const geminiRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${env.GEMINI_API_KEY}`,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(geminiBody) }
+        );
+        const geminiData = await geminiRes.json();
+        if (!geminiRes.ok) return jsonResponse(geminiData, geminiRes.status);
+
+        // Convert Gemini response back to Anthropic format so App.jsx is unchanged
+        const text = geminiData.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
+        return jsonResponse({ content: [{ type: "text", text }], stop_reason: "end_turn" });
       } catch (err) {
-        return errorResponse("Claude proxy error: " + err.message);
+        return errorResponse("Gemini proxy error: " + err.message);
       }
     }
 
@@ -311,13 +348,18 @@ export default {
           );
         }
 
-        // 1. Check KV cache first — instant lookup if this participant was seen before
+        // 1. Check KV cache first (skip if ?force=1 is passed to fix stale entries)
         const kvKey   = `participant:${normWS(name)}`;
-        const cached  = await env.LENNY_PARTICIPANTS.get(kvKey);
-        if (cached) {
-          const p = JSON.parse(cached);
-          console.log(`KV cache hit for "${name}": responseId=${p.response_id}`);
-          return jsonResponse({ responseId: p.response_id, participantName: p.name || name });
+        const force   = url.searchParams.get("force") === "1";
+        if (!force) {
+          const cached = await env.LENNY_PARTICIPANTS.get(kvKey);
+          if (cached) {
+            const p = JSON.parse(cached);
+            console.log(`KV cache hit for "${name}": responseId=${p.response_id}`);
+            return jsonResponse({ responseId: p.response_id, participantName: p.name || name });
+          }
+        } else {
+          console.log(`Force-bypass KV cache for "${name}"`);
         }
 
         // 2. Full Snapforms scan
