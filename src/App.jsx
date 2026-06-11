@@ -498,16 +498,43 @@ Do not include any explanation, markdown, or code fences. JSON only.${allText ? 
     }
     const data   = await res.json();
     const text   = data.content?.[0]?.text || "";
-    // Robust JSON extraction — handles Gemini responses that wrap JSON in code fences
-    // or append explanation text after the object
+    // Robust JSON extraction — handles Gemini responses that wrap JSON in code
+    // fences, append explanation text, include trailing commas, or have minor
+    // formatting issues that JSON.parse rejects.
     function extractJSON(raw) {
-      const stripped = raw.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
-      const start = stripped.indexOf("{");
-      const end   = stripped.lastIndexOf("}");
-      if (start !== -1 && end > start) return stripped.slice(start, end + 1);
-      return stripped;
+      // Strip code fences
+      let s = raw.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+      // Take the largest {…} block
+      const start = s.indexOf("{");
+      const end   = s.lastIndexOf("}");
+      if (start !== -1 && end > start) s = s.slice(start, end + 1);
+      return s;
     }
-    const parsed = JSON.parse(extractJSON(text));
+    function cleanJSON(s) {
+      // 1. Remove trailing commas before ] and } — most common AI mistake
+      let cleaned = s.replace(/,(\s*[}\]])/g, "$1");
+      // 2. Convert smart quotes to straight quotes
+      cleaned = cleaned.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'");
+      // 3. Strip BOM / invisible characters
+      cleaned = cleaned.replace(/[\uFEFF\u200B\u200C\u200D]/g, "");
+      return cleaned;
+    }
+    function tryParse(s) {
+      try { return JSON.parse(s); } catch (e1) {
+        // Retry after cleaning common AI mistakes
+        try { return JSON.parse(cleanJSON(s)); } catch (e2) {
+          // Surface the original error with a snippet of the offending area
+          const m = String(e1.message || "").match(/position\s+(\d+)/i);
+          if (m) {
+            const pos = parseInt(m[1], 10);
+            const ctx = s.slice(Math.max(0, pos - 60), Math.min(s.length, pos + 60));
+            throw new Error(`JSON parse failed: ${e1.message}\n\nContext around position ${pos}:\n…${ctx}…`);
+          }
+          throw e1;
+        }
+      }
+    }
+    const parsed = tryParse(extractJSON(text));
     if (!parsed.fields || !Array.isArray(parsed.fields)) throw new Error("Unexpected response from AI");
     return { fields: parsed.fields, detectedPronouns: parsed.pronouns || null };
   }
