@@ -510,6 +510,42 @@ Do not include any explanation, markdown, or code fences. JSON only.${allText ? 
       if (start !== -1 && end > start) s = s.slice(start, end + 1);
       return s;
     }
+    function fixUnescapedQuotesInJSON(s) {
+      // Walk character-by-character and escape any " inside a JSON string value
+      // that isn't a legitimate closing quote.
+      // Heuristic: a " is the closing quote when the next non-whitespace char is
+      // one of  ,  }  ]  :  (or end-of-string). Otherwise escape it.
+      let result = "";
+      let inString = false;
+      let i = 0;
+      while (i < s.length) {
+        const c = s[i];
+        if (!inString) {
+          result += c;
+          if (c === '"') inString = true;
+          i++;
+        } else if (c === "\\") {
+          // Already-escaped sequence — pass through verbatim
+          result += s.slice(i, Math.min(i + 2, s.length));
+          i += 2;
+        } else if (c === '"') {
+          const rest = s.slice(i + 1).replace(/^[ \t\r\n]*/, "");
+          if (rest.length === 0 || /^[,\}\]:]/.test(rest)) {
+            // Legitimate closing quote
+            result += '"';
+            inString = false;
+          } else {
+            // Unescaped internal quote — escape it
+            result += '\\"';
+          }
+          i++;
+        } else {
+          result += c;
+          i++;
+        }
+      }
+      return result;
+    }
     function cleanJSON(s) {
       // 1. Remove trailing commas before ] and } — most common AI mistake
       let cleaned = s.replace(/,(\s*[}\]])/g, "$1");
@@ -517,6 +553,8 @@ Do not include any explanation, markdown, or code fences. JSON only.${allText ? 
       cleaned = cleaned.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'");
       // 3. Strip BOM / invisible characters
       cleaned = cleaned.replace(/[\uFEFF\u200B\u200C\u200D]/g, "");
+      // 4. Fix unescaped double-quote characters inside JSON string values
+      cleaned = fixUnescapedQuotesInJSON(cleaned);
       return cleaned;
     }
     function tryParse(s) {
