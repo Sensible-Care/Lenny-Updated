@@ -85,17 +85,57 @@ function normWS(s) {
   return s.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+// Column names for the Section 47 Assessment & Care Review field table.
+// Used when the table has no existing rows (first-ever review entry).
+const REVIEW_COLUMNS = ["Date", "Staff Initial", "Section"];
+
+// Fallback checkbox question names for "Are there any Identified Risks?" per section.
+// These are used when the checkbox field is not found in the existing form answers
+// (e.g. because it was never answered and Snapforms omits null fields from the GET).
+const RISKS_CHECKBOX_QUESTIONS = {
+  "12. Disaster & Emergency Management":          "12. Disaster & Emergency Management: Are there any Identified Risks?",
+  "20. Personal Care":                            "20. Personal Care: Are there any Identified Risks?",
+  "21. Oral Hygiene":                             "21. Oral Hygiene: Are there any Identified Risks?",
+  "22. Toileting & Continence":                   "22. Toileting & Continence: Are there any Identified Risks?",
+  "23. Mobility & Transfers":                     "23. Mobility & Transfers: Are there any Identified Risks?",
+  "24. Household Tasks":                          "24. Household Tasks: Are there any Identified Risks?",
+  "25. Home Environment":                         "25. Home Environment: Are there any Identified Risks?",
+  "26. Communication & Sensory Care":             "26. Communication & Sensory Care: Are there any Identified Risks?",
+  "27. Nutrition & Meal Planning & Preparation":  "27. Nutrition & Meal Planning & Preparation: Are there any Identified Risks?",
+  "29. Clinical Care":                            "29. Clinical Care: Are there any Identified Risks?",
+  "30. Medication Management":                    "30. Medication Management: Are there any Identified Risks?",
+  "31. Skin Integrity":                           "31. Skin Integrity: Are there any Identified Risks?",
+  "32. Foot Health":                              "32. Foot Health: Are there any Identified Risks?",
+  "33. Sleep":                                    "33. Sleep: Are there any Identified Risks?",
+  "34. Breathing":                                "34. Breathing: Are there any Identified Risks?",
+  "37. Cognition & Mental Health":                "37. Cognition & Mental Health: Are there any Identified Risks?",
+  "38. Mental Health":                            "38. Mental Health: Are there any Identified Risks?",
+  "39. Carer":                                    "39. Carer: Are there any Identified Risks?",
+};
+
 // Append a new row to a Snapforms field table array.
 // existingArray: [{row:1, data:[{fieldname, fieldvalue}...]}, ...]  from GET
 // parts: array of string values to fill into columns in order.
+// defaultColumns: column names to use when existingArray is empty (first-ever row).
 // The last column absorbs any extra pipe-separated parts.
 // Returns the updated array, or null if the structure is unrecognisable.
-function appendFieldTableRow(existingArray, parts) {
-  if (!Array.isArray(existingArray) || existingArray.length === 0) return null;
-  const template = existingArray.find(r => Array.isArray(r.data) && r.data.length > 0);
-  if (!template) return null;
-  const fieldNames = template.data.map(d => d.fieldname || "");
-  const nextRowNum = Math.max(...existingArray.map(r => Number(r.row) || 0)) + 1;
+function appendFieldTableRow(existingArray, parts, defaultColumns = null) {
+  if (!Array.isArray(existingArray)) return null;
+
+  let fieldNames;
+  if (existingArray.length === 0) {
+    // No existing rows — bootstrap with default column structure if supplied
+    if (!defaultColumns || defaultColumns.length === 0) return null;
+    fieldNames = defaultColumns;
+  } else {
+    const template = existingArray.find(r => Array.isArray(r.data) && r.data.length > 0);
+    if (!template) return null;
+    fieldNames = template.data.map(d => d.fieldname || "");
+  }
+
+  const nextRowNum = existingArray.length > 0
+    ? Math.max(...existingArray.map(r => Number(r.row) || 0)) + 1
+    : 1;
   const newData = fieldNames.map((fn, i) => ({
     fieldname:  fn,
     fieldvalue: i < fieldNames.length - 1
@@ -245,12 +285,24 @@ export default {
           });
         }
 
+        // Detect whether the prompt is asking for JSON output — if so, use
+        // Gemini's JSON mode (responseMimeType) which guarantees valid, escaped JSON.
+        const allPromptText = (body.messages || [])
+          .flatMap(m => Array.isArray(m.content)
+            ? m.content.filter(b => b.type === "text").map(b => b.text)
+            : [String(m.content || "")])
+          .join(" ");
+        const wantsJson = /\bjson\b/i.test(allPromptText);
+
         const geminiBody = {
           contents: (body.messages || []).map(msg => ({
             role:  msg.role === "assistant" ? "model" : "user",
             parts: toGeminiParts(msg.content),
           })),
-          generationConfig: { maxOutputTokens: body.max_tokens || 8192 },
+          generationConfig: {
+            maxOutputTokens: body.max_tokens || 8192,
+            ...(wantsJson ? { responseMimeType: "application/json" } : {}),
+          },
           // Disable safety blocks that could interfere with aged-care clinical content
           safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT",        threshold: "BLOCK_NONE" },
@@ -514,21 +566,66 @@ export default {
                   return hit ? hit.answer : null;
                 })();
 
-            if (rawArr) {
-              const parts   = item.answer.split(/\s*\|\s*/);
-              const updated = appendFieldTableRow(rawArr, parts);
+            const parts = item.answer.split(/\s*\|\s*/);
+
+            if (rawArr !== null && rawArr !== undefined) {
+              // Pass REVIEW_COLUMNS as default so empty arrays (first-ever row) still work
+              const updated = appendFieldTableRow(rawArr, parts, REVIEW_COLUMNS);
               if (updated) {
                 console.log(`Field-table append for "${q}": now ${updated.length} row(s)`);
                 return { question: q, answer: updated };
               }
             }
-            // Fallback: plain-text append (no existing table found)
+
+            // rawArr was null (field absent or answer was null — no previous rows ever).
+            // For review-type questions, create the table from scratch.
+            if (/47|review/i.test(q)) {
+              const updated = appendFieldTableRow([], parts, REVIEW_COLUMNS);
+              if (updated) {
+                console.log(`New field-table for "${q}": created row 1`);
+                return { question: q, answer: updated };
+              }
+            }
+
+            // Fallback: plain-text append (non-review appendPlain fields)
             return { question: q, answer: prev ? `${prev}\n${item.answer}` : item.answer };
           }
 
           // Normal text field: blank-line-separated append
           return { question: q, answer: prev ? `${prev}\n\n${item.answer}` : item.answer };
         });
+
+        // 2b. Auto-tick "Are there any Identified Risks?" checkboxes.
+        // When Lenny writes content to a section's Identified Risks text field, the
+        // companion checkbox that gates visibility of that field must also be ticked.
+        // Strategy: look for the checkbox in existingRaw first (most reliable), then
+        // fall back to the hardcoded RISKS_CHECKBOX_QUESTIONS map.
+        for (const item of payload) {
+          const q = item.question.trim();
+          // Match "22. Toileting & Continence: Identified Risks" etc.
+          const riskMatch = q.match(/^(\d+\.\s+.+?):\s+Identified Risks$/i);
+          if (!riskMatch) continue;
+          const sectionPrefix = riskMatch[1].trim();
+
+          // Try to find the checkbox in the live form data first
+          let checkboxQ = null;
+          const checkboxField = existingRaw.find(f => {
+            const fq = String(f.question || "").trim();
+            return fq.toLowerCase().startsWith(sectionPrefix.toLowerCase()) &&
+                   /Are there any Identified Risks\?/i.test(fq);
+          });
+          if (checkboxField) {
+            checkboxQ = checkboxField.question.trim();
+          } else {
+            // Fall back to hardcoded map (Snapforms may omit null-valued fields from GET)
+            checkboxQ = RISKS_CHECKBOX_QUESTIONS[sectionPrefix] || null;
+          }
+
+          if (checkboxQ && !changedOnly.some(c => c.question === checkboxQ)) {
+            console.log(`Auto-ticking risks checkbox: "${checkboxQ}"`);
+            changedOnly.push({ question: checkboxQ, answer: true });
+          }
+        }
 
         // 3. PUT only changed fields to Snapforms (retry up to 3 times on 5xx/524)
         const putBody = JSON.stringify(changedOnly);

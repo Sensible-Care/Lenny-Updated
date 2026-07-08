@@ -452,6 +452,16 @@ export default function App() {
     const docxTexts = files.filter(f => f.kind === "docx_text").map(f => f.text);
     const allText   = [notesText, ...docxTexts].filter(Boolean).join("\n\n");
 
+    // Replace straight double quotes in the source text with typographic equivalents.
+    // Straight " inside a JSON string value must be escaped as \" — if Gemini echoes
+    // the text back without escaping them, the JSON breaks.  Using curly quotes avoids
+    // this entirely without changing the meaning of clinical content.
+    const safeText = allText
+      .replace(/“|”/g, "'")   // already-curly quotes → apostrophe (normalise first)
+      .replace(/(?<=\s|^)"(?=\S)/g, "“")  // opening straight quote → left "
+      .replace(/(?<=\S)"(?=[\s.,;:!?]|$)/g, "”")  // closing straight quote → right "
+      .replace(/"/g, "'");              // any remaining straight quotes → single quote
+
     const instruction = `You are a care plan assistant for an aged care organisation. Extract care plan updates from the notes and/or attached files below and return ONLY a valid JSON object in this exact format:
 {"fields": [{"key": "20_goals", "answer": "..."}, ...], "pronouns": "she"}
 
@@ -469,7 +479,7 @@ Key mapping rules — pay close attention to these distinctions:
 - Do NOT put participant goals or outcomes into a _recs field
 - Each piece of content should go into exactly one field — do not duplicate content across multiple fields
 
-Do not include any explanation, markdown, or code fences. JSON only.${allText ? `\n\nNotes:\n${allText}` : ""}`;
+Do not include any explanation, markdown, or code fences. JSON only.${safeText ? `\n\nNotes:\n${safeText}` : ""}`;
 
     // Build content array — text instruction first, then any image/PDF attachments
     const content = [{ type: "text", text: instruction }];
@@ -498,81 +508,16 @@ Do not include any explanation, markdown, or code fences. JSON only.${allText ? 
     }
     const data   = await res.json();
     const text   = data.content?.[0]?.text || "";
-    // Robust JSON extraction — handles Gemini responses that wrap JSON in code
-    // fences, append explanation text, include trailing commas, or have minor
-    // formatting issues that JSON.parse rejects.
+    // Robust JSON extraction — handles Gemini responses that wrap JSON in code fences
+    // or append explanation text after the object
     function extractJSON(raw) {
-      // Strip code fences
-      let s = raw.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
-      // Take the largest {…} block
-      const start = s.indexOf("{");
-      const end   = s.lastIndexOf("}");
-      if (start !== -1 && end > start) s = s.slice(start, end + 1);
-      return s;
+      const stripped = raw.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+      const start = stripped.indexOf("{");
+      const end   = stripped.lastIndexOf("}");
+      if (start !== -1 && end > start) return stripped.slice(start, end + 1);
+      return stripped;
     }
-    function fixUnescapedQuotesInJSON(s) {
-      // Walk character-by-character and escape any " inside a JSON string value
-      // that isn't a legitimate closing quote.
-      // Heuristic: a " is the closing quote when the next non-whitespace char is
-      // one of  ,  }  ]  :  (or end-of-string). Otherwise escape it.
-      let result = "";
-      let inString = false;
-      let i = 0;
-      while (i < s.length) {
-        const c = s[i];
-        if (!inString) {
-          result += c;
-          if (c === '"') inString = true;
-          i++;
-        } else if (c === "\\") {
-          // Already-escaped sequence — pass through verbatim
-          result += s.slice(i, Math.min(i + 2, s.length));
-          i += 2;
-        } else if (c === '"') {
-          const rest = s.slice(i + 1).replace(/^[ \t\r\n]*/, "");
-          if (rest.length === 0 || /^[,\}\]:]/.test(rest)) {
-            // Legitimate closing quote
-            result += '"';
-            inString = false;
-          } else {
-            // Unescaped internal quote — escape it
-            result += '\\"';
-          }
-          i++;
-        } else {
-          result += c;
-          i++;
-        }
-      }
-      return result;
-    }
-    function cleanJSON(s) {
-      // 1. Remove trailing commas before ] and } — most common AI mistake
-      let cleaned = s.replace(/,(\s*[}\]])/g, "$1");
-      // 2. Convert smart quotes to straight quotes
-      cleaned = cleaned.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'");
-      // 3. Strip BOM / invisible characters
-      cleaned = cleaned.replace(/[\uFEFF\u200B\u200C\u200D]/g, "");
-      // 4. Fix unescaped double-quote characters inside JSON string values
-      cleaned = fixUnescapedQuotesInJSON(cleaned);
-      return cleaned;
-    }
-    function tryParse(s) {
-      try { return JSON.parse(s); } catch (e1) {
-        // Retry after cleaning common AI mistakes
-        try { return JSON.parse(cleanJSON(s)); } catch (e2) {
-          // Surface the original error with a snippet of the offending area
-          const m = String(e1.message || "").match(/position\s+(\d+)/i);
-          if (m) {
-            const pos = parseInt(m[1], 10);
-            const ctx = s.slice(Math.max(0, pos - 60), Math.min(s.length, pos + 60));
-            throw new Error(`JSON parse failed: ${e1.message}\n\nContext around position ${pos}:\n…${ctx}…`);
-          }
-          throw e1;
-        }
-      }
-    }
-    const parsed = tryParse(extractJSON(text));
+    const parsed = JSON.parse(extractJSON(text));
     if (!parsed.fields || !Array.isArray(parsed.fields)) throw new Error("Unexpected response from AI");
     return { fields: parsed.fields, detectedPronouns: parsed.pronouns || null };
   }
