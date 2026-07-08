@@ -508,16 +508,51 @@ Do not include any explanation, markdown, or code fences. JSON only.${safeText ?
     }
     const data   = await res.json();
     const text   = data.content?.[0]?.text || "";
-    // Robust JSON extraction — handles Gemini responses that wrap JSON in code fences
-    // or append explanation text after the object
-    function extractJSON(raw) {
-      const stripped = raw.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
-      const start = stripped.indexOf("{");
-      const end   = stripped.lastIndexOf("}");
-      if (start !== -1 && end > start) return stripped.slice(start, end + 1);
-      return stripped;
+
+    // ── Robust JSON extraction + repair ───────────────────────────────────────
+    // 1. Strip markdown code fences and find the outermost { … } object.
+    // 2. If JSON.parse fails, run a character-level repair pass that escapes any
+    //    unescaped double-quote characters sitting INSIDE a string value.
+    //    Strategy: when we see a `"` while already inside a string, look at the
+    //    very next non-whitespace character.  If it is a JSON structural character
+    //    ( : , } ] or end-of-input ) the quote is the legitimate string-close.
+    //    Otherwise it is an unescaped inner quote — replace it with \".
+    function extractAndRepairJSON(raw) {
+      // Step 1 — strip fences and extract outermost object
+      let s = raw.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+      const start = s.indexOf("{");
+      const end   = s.lastIndexOf("}");
+      if (start !== -1 && end > start) s = s.slice(start, end + 1);
+
+      // Step 2 — try as-is
+      try { JSON.parse(s); return s; } catch (_) { /* repair */ }
+
+      // Step 3 — character-level repair
+      let out = "";
+      let inString = false;
+      let escaped  = false;
+      for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (escaped)           { out += ch; escaped = false; continue; }
+        if (ch === "\\" && inString) { escaped = true; out += ch; continue; }
+        if (ch === '"') {
+          if (!inString) { inString = true; out += ch; continue; }
+          // Inside a string — decide: closing quote or unescaped inner quote?
+          const after = s.slice(i + 1).trimStart();
+          const next  = after[0] ?? "";
+          if (next === ":" || next === "," || next === "}" || next === "]" || next === "") {
+            inString = false; out += ch; // legitimate close
+          } else {
+            out += '\\"';               // escape the inner quote
+          }
+          continue;
+        }
+        out += ch;
+      }
+      return out;
     }
-    const parsed = JSON.parse(extractJSON(text));
+
+    const parsed = JSON.parse(extractAndRepairJSON(text));
     if (!parsed.fields || !Array.isArray(parsed.fields)) throw new Error("Unexpected response from AI");
     return { fields: parsed.fields, detectedPronouns: parsed.pronouns || null };
   }
