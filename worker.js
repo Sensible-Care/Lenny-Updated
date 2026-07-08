@@ -294,14 +294,39 @@ export default {
           .join(" ");
         const wantsJson = /\bjson\b/i.test(allPromptText);
 
+        // Schema for the care-plan update response — used when JSON output is requested.
+        // Providing an explicit schema is stronger than responseMimeType alone: Gemini
+        // is constrained to produce exactly this structure with properly-escaped strings.
+        const careUpdateSchema = {
+          type: "OBJECT",
+          properties: {
+            fields: {
+              type: "ARRAY",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  key:    { type: "STRING" },
+                  answer: { type: "STRING" },
+                },
+                required: ["key", "answer"],
+              },
+            },
+            pronouns: { type: "STRING", nullable: true },
+          },
+          required: ["fields"],
+        };
+
         const geminiBody = {
           contents: (body.messages || []).map(msg => ({
             role:  msg.role === "assistant" ? "model" : "user",
             parts: toGeminiParts(msg.content),
           })),
           generationConfig: {
-            maxOutputTokens: body.max_tokens || 8192,
-            ...(wantsJson ? { responseMimeType: "application/json" } : {}),
+            maxOutputTokens: body.max_tokens || 16384,  // increased for large DOCX inputs
+            ...(wantsJson ? {
+              responseMimeType: "application/json",
+              responseSchema:   careUpdateSchema,
+            } : {}),
           },
           // Disable safety blocks that could interfere with aged-care clinical content
           safetySettings: [

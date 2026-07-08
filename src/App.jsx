@@ -510,40 +510,41 @@ Do not include any explanation, markdown, or code fences. JSON only.${safeText ?
     const text   = data.content?.[0]?.text || "";
 
     // ── Robust JSON extraction + repair ───────────────────────────────────────
-    // 1. Strip markdown code fences and find the outermost { … } object.
-    // 2. If JSON.parse fails, run a character-level repair pass that escapes any
-    //    unescaped double-quote characters sitting INSIDE a string value.
-    //    Strategy: when we see a `"` while already inside a string, look at the
-    //    very next non-whitespace character.  If it is a JSON structural character
-    //    ( : , } ] or end-of-input ) the quote is the legitimate string-close.
-    //    Otherwise it is an unescaped inner quote — replace it with \".
+    // Handles the three most common ways Gemini breaks JSON:
+    //   (a) unescaped double-quotes inside string values  "She has "limited" mobility."
+    //   (b) literal newline / tab characters inside string values
+    //   (c) markdown code fences or trailing explanation text around the object
     function extractAndRepairJSON(raw) {
-      // Step 1 — strip fences and extract outermost object
+      // Step 1 — strip markdown fences, find outermost { … }
       let s = raw.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
       const start = s.indexOf("{");
       const end   = s.lastIndexOf("}");
       if (start !== -1 && end > start) s = s.slice(start, end + 1);
 
-      // Step 2 — try as-is
-      try { JSON.parse(s); return s; } catch (_) { /* repair */ }
-
-      // Step 3 — character-level repair
+      // Step 2 — character-level repair (always run — cheaper than a failed parse)
+      const CTRL = { "\n": "\\n", "\r": "\\r", "\t": "\\t" };
       let out = "";
       let inString = false;
       let escaped  = false;
       for (let i = 0; i < s.length; i++) {
         const ch = s[i];
-        if (escaped)           { out += ch; escaped = false; continue; }
+        // Handle the character after a backslash (already-escaped sequence)
+        if (escaped) { out += ch; escaped = false; continue; }
         if (ch === "\\" && inString) { escaped = true; out += ch; continue; }
+        // Control characters must be escaped inside JSON strings
+        if (inString && CTRL[ch]) { out += CTRL[ch]; continue; }
         if (ch === '"') {
           if (!inString) { inString = true; out += ch; continue; }
-          // Inside a string — decide: closing quote or unescaped inner quote?
+          // We're inside a string. Is this the closing quote or an unescaped inner quote?
+          // Look at the next non-whitespace character:
+          //   JSON structural chars (:  ,  }  ]) or end-of-input → legitimate string-close
+          //   Anything else → unescaped quote inside the value → escape it
           const after = s.slice(i + 1).trimStart();
           const next  = after[0] ?? "";
           if (next === ":" || next === "," || next === "}" || next === "]" || next === "") {
-            inString = false; out += ch; // legitimate close
+            inString = false; out += ch;
           } else {
-            out += '\\"';               // escape the inner quote
+            out += '\\"';
           }
           continue;
         }
@@ -552,7 +553,14 @@ Do not include any explanation, markdown, or code fences. JSON only.${safeText ?
       return out;
     }
 
-    const parsed = JSON.parse(extractAndRepairJSON(text));
+    let parsed;
+    try {
+      parsed = JSON.parse(extractAndRepairJSON(text));
+    } catch (e) {
+      // Log first 300 chars of the raw Gemini response to help diagnose future failures
+      console.error("JSON repair failed. Raw response start:", text.slice(0, 300));
+      throw new Error(`JSON parse failed: ${e.message}  —  Response started: ${text.slice(0, 120)}`);
+    }
     if (!parsed.fields || !Array.isArray(parsed.fields)) throw new Error("Unexpected response from AI");
     return { fields: parsed.fields, detectedPronouns: parsed.pronouns || null };
   }
