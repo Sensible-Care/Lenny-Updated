@@ -479,7 +479,11 @@ Key mapping rules — pay close attention to these distinctions:
 - Do NOT put participant goals or outcomes into a _recs field
 - Each piece of content should go into exactly one field — do not duplicate content across multiple fields
 
-Do not include any explanation, markdown, or code fences. JSON only.${safeText ? `\n\nNotes:\n${safeText}` : ""}`;
+CRITICAL JSON RULES — you must follow these exactly or the output will break:
+1. Return ONLY the JSON object. No explanation, no markdown, no code fences.
+2. Do NOT use double-quote characters (") anywhere inside field values. If you need to quote a term or product name, use single quotes (') instead. For example: write She uses a 'walker' NOT She uses a "walker".
+3. Do not use any special escape sequences other than \\n for a new line if needed.
+${safeText ? `\n\nNotes:\n${safeText}` : ""}`;
 
     // Build content array — text instruction first, then any image/PDF attachments
     const content = [{ type: "text", text: instruction }];
